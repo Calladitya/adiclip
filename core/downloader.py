@@ -53,6 +53,11 @@ def sanitize_filename(name: str) -> str:
     return name[:60] if len(name) > 60 else name
 
 
+def _is_http_403(error: Exception) -> bool:
+    message = str(error).lower()
+    return "403" in message or "forbidden" in message
+
+
 def get_video_metadata(video_path: str) -> Dict[str, Any]:
     """
     Extracts video duration, resolution, fps, and frame count using OpenCV.
@@ -183,7 +188,6 @@ def download_youtube_video(
     # in restricted Windows environments.
     job_dir = output_dir / f"podclip_yt_{uuid.uuid4().hex}"
     job_dir.mkdir(parents=False, exist_ok=False)
-    out_template = str(job_dir / f"{clean_title}_%(id)s.%(ext)s")
 
     def check_cancelled():
         if cancel_event is not None and cancel_event.is_set():
@@ -219,7 +223,6 @@ def download_youtube_video(
 
     ydl_opts = {
         "format": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best[height<=1080]",
-        "outtmpl": out_template,
         # Pass the binary itself: imageio-ffmpeg uses a versioned filename,
         # which yt-dlp cannot discover when given only the containing folder.
         "ffmpeg_location": ffmpeg_exe,
@@ -240,14 +243,50 @@ def download_youtube_video(
         check_cancelled()
         logger.info("[DOWNLOAD] Initializing; validating URL and connecting to YouTube (video id=%s)", info.get("id", "unknown"))
         logger.info("[DOWNLOAD] Download started (video id=%s)", info.get("id", "unknown"))
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            dl_info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(dl_info)
-            if not filename.endswith(".mp4"):
-                base, _ = os.path.splitext(filename)
-                mp4_path = base + ".mp4"
-                if os.path.exists(mp4_path):
-                    filename = mp4_path
+        attempts = [
+            ("default", dict(ydl_opts)),
+            (
+                "lower-bandwidth format fallback",
+                {
+                    **ydl_opts,
+                    "format": "best[ext=mp4][height<=720]/best[ext=mp4][height<=480]/best[height<=720]/best",
+                },
+            ),
+        ]
+        filename = None
+        primary_403_error = None
+        for attempt_index, (attempt_name, attempt_options) in enumerate(attempts):
+            check_cancelled()
+            attempt_dir = job_dir / f"attempt_{attempt_index + 1}"
+            attempt_dir.mkdir()
+            attempt_options["outtmpl"] = str(attempt_dir / f"{clean_title}_%(id)s.%(ext)s")
+            if attempt_index:
+                logger.warning("[DOWNLOAD] Retrying with %s after HTTP 403", attempt_name)
+                if progress_callback:
+                    progress_callback(None, "YouTube refused the first format; retrying with a lower-bandwidth format...")
+            try:
+                with yt_dlp.YoutubeDL(attempt_options) as ydl:
+                    dl_info = ydl.extract_info(url, download=True)
+                    filename = ydl.prepare_filename(dl_info)
+                    if not os.path.isfile(filename):
+                        base, _ = os.path.splitext(filename)
+                        merged_mp4 = base + ".mp4"
+                        if os.path.isfile(merged_mp4):
+                            filename = merged_mp4
+            except Exception as attempt_error:
+                if attempt_index == 0 and _is_http_403(attempt_error):
+                    primary_403_error = attempt_error
+                    logger.warning("[DOWNLOAD] Primary YouTube format returned HTTP 403; trying compatible fallback")
+                    shutil.rmtree(attempt_dir, ignore_errors=True)
+                    continue
+                if primary_403_error is not None:
+                    raise RuntimeError(
+                        f"YouTube rejected the initial download with HTTP 403; the lower-bandwidth retry also failed: {attempt_error}"
+                    ) from attempt_error
+                raise
+            break
+        if not filename:
+            raise RuntimeError("YouTube download did not produce a file.")
         check_cancelled()
         logger.info("[DOWNLOAD] Validating downloaded file")
         if not os.path.isfile(filename) or os.path.getsize(filename) == 0:
@@ -256,7 +295,8 @@ def download_youtube_video(
         if progress_callback:
             progress_callback(1.0, "Download completed and validated.")
         metadata = get_video_metadata(filename)
-        destination = output_dir / f"{clean_title}_{info.get('id') or 'youtube'}_{uuid.uuid4().hex[:8]}.mp4"
+        extension = Path(filename).suffix.lower() or ".mp4"
+        destination = output_dir / f"{clean_title}_{info.get('id') or 'youtube'}_{uuid.uuid4().hex[:8]}{extension}"
         shutil.move(filename, destination)
         metadata["path"] = str(destination)
         metadata["filename"] = destination.name
@@ -271,8 +311,17 @@ def download_youtube_video(
             raise InterruptedError("YouTube download was cancelled.") from exc
         logger.exception("[DOWNLOAD] Failed for video id=%s", info.get("id", "unknown"))
         message = str(exc)
+        if "requested format is not available" in message.lower() and not shutil.which("deno"):
+            raise RuntimeError(
+                "yt-dlp found no downloadable format because the Deno JavaScript runtime is missing. "
+                "Install the updated project requirements (yt-dlp[default,deno]) and restart the app."
+            ) from exc
         if "403" in message or "Forbidden" in message:
-            raise RuntimeError("YouTube refused the video download (HTTP 403). This is a YouTube access restriction; try another public video or upload the video file.") from exc
+            raise RuntimeError(
+                f"YouTube refused the video download (HTTP 403), including the lower-bandwidth retry. "
+                f"This can be a YouTube or hosting-network restriction. Details: {message[:400]} "
+                "Try another public video or upload the file."
+            ) from exc
         raise
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
