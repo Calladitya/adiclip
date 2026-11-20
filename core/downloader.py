@@ -3,6 +3,11 @@ Downloader module for YouTube videos and local video file handling.
 """
 import os
 import re
+import logging
+import shutil
+import subprocess
+import time
+import uuid
 import cv2
 from urllib.parse import urlparse
 from pathlib import Path
@@ -10,6 +15,23 @@ from typing import Dict, Any, Optional, Callable
 import yt_dlp
 
 from core.config import DOWNLOADS_DIR, get_ffmpeg_path
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logger.addHandler(_handler)
+logger.setLevel(logging.INFO)
+DOWNLOAD_TIMEOUT_SECONDS = 2 * 60 * 60
+YTDLP_SOCKET_TIMEOUT_SECONDS = 20
+YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be", "www.youtube-nocookie.com"}
+
+
+def _validate_youtube_url(url: str) -> str:
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme not in {"http", "https"} or (parsed.hostname or "").lower() not in YOUTUBE_HOSTS:
+        raise ValueError("Enter a valid YouTube video URL (youtube.com or youtu.be).")
+    return url.strip()
 
 
 def _youtube_proxy_options() -> Dict[str, str]:
@@ -58,19 +80,68 @@ def get_video_metadata(video_path: str) -> Dict[str, Any]:
     }
 
 
-def fetch_youtube_info(url: str) -> Dict[str, Any]:
+def _validate_download(path: str) -> None:
+    """Require readable audio/video streams; use ffprobe when installed, PyAV otherwise."""
+    if not os.path.isfile(path) or os.path.getsize(path) <= 0:
+        raise RuntimeError("Download produced no video file or an empty file.")
+    ffprobe = shutil.which("ffprobe")
+    if ffprobe:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "stream=codec_type", "-show_entries", "format=duration", "-of", "json", path],
+            capture_output=True, text=True, timeout=60, check=False,
+        )
+        if result.returncode:
+            raise RuntimeError(f"FFprobe could not read the downloaded video: {result.stderr.strip()[:500]}")
+        import json
+        probe = json.loads(result.stdout or "{}")
+        stream_types = {stream.get("codec_type") for stream in probe.get("streams", [])}
+        try:
+            duration = float(probe.get("format", {}).get("duration", 0))
+        except (TypeError, ValueError):
+            duration = 0
+        if "video" not in stream_types or "audio" not in stream_types or duration <= 0:
+            raise RuntimeError("FFprobe found no valid audio/video streams or duration in the downloaded file.")
+        return
+
+    # Windows imageio-ffmpeg bundles ffmpeg without ffprobe. Validate through PyAV,
+    # which is already an application dependency, and decode an actual video frame.
+    import av
+    try:
+        with av.open(path) as container:
+            if not any(stream.type == "video" for stream in container.streams):
+                raise RuntimeError("Downloaded file contains no video stream.")
+            if not any(stream.type == "audio" for stream in container.streams):
+                raise RuntimeError("Downloaded file contains no audio stream.")
+            if not next(container.decode(video=0), None):
+                raise RuntimeError("Downloaded video stream could not decode a frame.")
+    except Exception as exc:
+        if isinstance(exc, RuntimeError):
+            raise
+        raise RuntimeError(f"Downloaded video failed PyAV stream/decode validation: {exc}") from exc
+
+
+def fetch_youtube_info(url: str, cancel_event=None) -> Dict[str, Any]:
     """
     Fetches YouTube video metadata without downloading the full video.
     """
+    url = _validate_youtube_url(url)
+    logger.info("[DOWNLOAD] Validating URL and connecting to YouTube")
     ydl_opts = {
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,
         "skip_download": True,
         "extract_flat": False,
+        "socket_timeout": YTDLP_SOCKET_TIMEOUT_SECONDS,
+        "retries": 2,
+        "extractor_retries": 2,
+        "noplaylist": True,
         **_youtube_proxy_options(),
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         try:
+            if cancel_event is not None and cancel_event.is_set():
+                raise InterruptedError("YouTube metadata lookup was cancelled.")
             info = ydl.extract_info(url, download=False)
             if not info:
                 raise ValueError("Could not extract video metadata from URL.")
@@ -82,6 +153,8 @@ def fetch_youtube_info(url: str) -> Dict[str, Any]:
                 "thumbnail": info.get("thumbnail", ""),
                 "description": info.get("description", "")[:200] if info.get("description") else "",
             }
+        except InterruptedError:
+            raise
         except Exception as e:
             raise RuntimeError(f"Failed to fetch YouTube metadata: {str(e)}")
 
@@ -90,6 +163,8 @@ def download_youtube_video(
     url: str,
     output_dir: Optional[Path] = None,
     progress_callback: Optional[Callable[[float, str], None]] = None,
+    video_info: Optional[Dict[str, Any]] = None,
+    cancel_event=None,
 ) -> Dict[str, Any]:
     """
     Downloads a YouTube video to the output directory with progress updates.
@@ -97,51 +172,110 @@ def download_youtube_video(
     if output_dir is None:
         output_dir = DOWNLOADS_DIR
 
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg_exe = get_ffmpeg_path()
-
-    # First fetch info
-    info = fetch_youtube_info(url)
+    started = time.monotonic()
+    info = video_info or fetch_youtube_info(url, cancel_event=cancel_event)
     clean_title = sanitize_filename(info["title"])
-    out_template = str(output_dir / f"{clean_title}_%(id)s.%(ext)s")
+    # Path.mkdir inherits the app directory ACL on Windows. tempfile.mkdtemp can
+    # create a directory whose inherited ACL denies the Streamlit process writes
+    # in restricted Windows environments.
+    job_dir = output_dir / f"podclip_yt_{uuid.uuid4().hex}"
+    job_dir.mkdir(parents=False, exist_ok=False)
+    out_template = str(job_dir / f"{clean_title}_%(id)s.%(ext)s")
 
+    def check_cancelled():
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("YouTube download was cancelled.")
+        if time.monotonic() - started > DOWNLOAD_TIMEOUT_SECONDS:
+            raise TimeoutError("YouTube download exceeded the 2 hour limit.")
+
+    last_logged_percent = -10
     def yt_hook(d):
+        nonlocal last_logged_percent
+        check_cancelled()
         if progress_callback and d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             downloaded = d.get("downloaded_bytes", 0)
             if total > 0:
                 pct = min(1.0, downloaded / total)
-                progress_callback(pct, f"Downloading YouTube video: {pct * 100:.1f}%")
+                speed = d.get("speed")
+                eta = d.get("eta")
+                details = []
+                if speed:
+                    details.append(f"{speed / (1024 * 1024):.1f} MB/s")
+                if eta is not None:
+                    details.append(f"ETA {int(eta)}s")
+                suffix = f" ({', '.join(details)})" if details else ""
+                progress_callback(pct, f"Downloading video: {pct * 100:.1f}% · {downloaded / (1024 * 1024):.1f} MB{suffix}")
+                if int(pct * 100) >= last_logged_percent + 10:
+                    logger.info("[DOWNLOAD] Progress update: %.1f%%, %.1f MB downloaded", pct * 100, downloaded / (1024 * 1024))
+                    last_logged_percent = int(pct * 100)
+            elif progress_callback:
+                progress_callback(None, f"Downloading YouTube video: {downloaded / (1024 * 1024):.1f} MB received")
         elif progress_callback and d.get("status") == "finished":
-            progress_callback(1.0, "YouTube download complete. Finalizing file...")
+            progress_callback(None, "Download data received; finalizing MP4...")
 
     ydl_opts = {
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "format": "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best[height<=1080]",
         "outtmpl": out_template,
         # Pass the binary itself: imageio-ffmpeg uses a versioned filename,
         # which yt-dlp cannot discover when given only the containing folder.
         "ffmpeg_location": ffmpeg_exe,
         "quiet": True,
         "no_warnings": True,
+        "noprogress": True,
         "progress_hooks": [yt_hook],
+        "socket_timeout": YTDLP_SOCKET_TIMEOUT_SECONDS,
+        "retries": 3,
+        "fragment_retries": 3,
+        "file_access_retries": 2,
+        "noplaylist": True,
         "merge_output_format": "mp4",
         **_youtube_proxy_options(),
     }
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        dl_info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(dl_info)
-        # Ensure .mp4 extension
-        if not filename.endswith(".mp4"):
-            base, _ = os.path.splitext(filename)
-            mp4_path = base + ".mp4"
-            if os.path.exists(mp4_path):
-                filename = mp4_path
-
-    metadata = get_video_metadata(filename)
-    metadata["title"] = info["title"]
-    metadata["thumbnail"] = info.get("thumbnail")
-    metadata["author"] = info.get("author")
-    return metadata
+    try:
+        check_cancelled()
+        logger.info("[DOWNLOAD] Initializing; validating URL and connecting to YouTube (video id=%s)", info.get("id", "unknown"))
+        logger.info("[DOWNLOAD] Download started (video id=%s)", info.get("id", "unknown"))
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            dl_info = ydl.extract_info(url, download=True)
+            filename = ydl.prepare_filename(dl_info)
+            if not filename.endswith(".mp4"):
+                base, _ = os.path.splitext(filename)
+                mp4_path = base + ".mp4"
+                if os.path.exists(mp4_path):
+                    filename = mp4_path
+        check_cancelled()
+        logger.info("[DOWNLOAD] Validating downloaded file")
+        if not os.path.isfile(filename) or os.path.getsize(filename) == 0:
+            raise RuntimeError("YouTube download finished without producing a video file.")
+        _validate_download(filename)
+        if progress_callback:
+            progress_callback(1.0, "Download completed and validated.")
+        metadata = get_video_metadata(filename)
+        destination = output_dir / f"{clean_title}_{info.get('id') or 'youtube'}_{uuid.uuid4().hex[:8]}.mp4"
+        shutil.move(filename, destination)
+        metadata["path"] = str(destination)
+        metadata["filename"] = destination.name
+        metadata["title"] = info["title"]
+        metadata["thumbnail"] = info.get("thumbnail")
+        metadata["author"] = info.get("author")
+        logger.info("[DOWNLOAD] Complete: %s (%.1f MB)", destination.name, destination.stat().st_size / (1024 * 1024))
+        return metadata
+    except Exception as exc:
+        if cancel_event is not None and cancel_event.is_set():
+            logger.info("[DOWNLOAD] Cancelled by user; removing this job's partial files")
+            raise InterruptedError("YouTube download was cancelled.") from exc
+        logger.exception("[DOWNLOAD] Failed for video id=%s", info.get("id", "unknown"))
+        message = str(exc)
+        if "403" in message or "Forbidden" in message:
+            raise RuntimeError("YouTube refused the video download (HTTP 403). This is a YouTube access restriction; try another public video or upload the video file.") from exc
+        raise
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
 
 
 def save_uploaded_file(uploaded_file, output_dir: Optional[Path] = None) -> Dict[str, Any]:

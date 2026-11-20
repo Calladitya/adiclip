@@ -30,6 +30,8 @@ from core.subtitle_generator import SUBTITLE_STYLES, CAPTION_COLORS
 from core.video_processor import process_all_clips, create_clips_zip
 from core.performance import process_resource_snapshot
 
+_pipeline_slot_lock = threading.Lock()
+
 
 @st.cache_resource
 def _pipeline_executor():
@@ -37,12 +39,14 @@ def _pipeline_executor():
     return ThreadPoolExecutor(max_workers=1, thread_name_prefix="podclip-pipeline")
 
 
-def _run_pipeline_job(source, settings, progress_queue, cancel_event):
+def _run_pipeline_job(source, settings, progress_queue, cancel_event, started_event):
+    started_event.set()
+    progress_queue.put((0.01, "Pipeline worker started. Preparing source..."))
     total_started = time.perf_counter()
     resource_start = process_resource_snapshot()
     timings = {}
     def report(progress, message):
-        progress_queue.put((max(0.0, min(1.0, float(progress))), str(message)))
+        progress_queue.put((None if progress is None else max(0.0, min(1.0, float(progress))), str(message)))
 
     def ensure_not_cancelled():
         if cancel_event.is_set():
@@ -53,13 +57,18 @@ def _run_pipeline_job(source, settings, progress_queue, cancel_event):
         report(0.02, "Saving uploaded source video...")
         video_meta = save_uploaded_file(source["file"])
     else:
-        report(0.02, "Downloading source video...")
+        report(0.02, "Initializing download and connecting to YouTube...")
 
         def download_progress(pct, message):
             ensure_not_cancelled()
-            report(0.02 + min(1.0, pct) * 0.18, message)
+            report(None if pct is None else 0.02 + min(1.0, pct) * 0.18, message)
 
-        video_meta = download_youtube_video(source["url"], progress_callback=download_progress)
+        video_meta = download_youtube_video(
+            source["url"],
+            progress_callback=download_progress,
+            video_info=source.get("info"),
+            cancel_event=cancel_event,
+        )
     timings["ingest_seconds"] = round(time.perf_counter() - stage_started, 3)
     ensure_not_cancelled()
 
@@ -148,15 +157,25 @@ def _pipeline_progress_fragment():
         return
     while True:
         try:
-            st.session_state.pipeline_progress, st.session_state.pipeline_message = job["queue"].get_nowait()
+            progress, message = job["queue"].get_nowait()
+            if progress is not None:
+                st.session_state.pipeline_progress = progress
+            st.session_state.pipeline_message = message
         except queue.Empty:
             break
+    if not job["started"].is_set() and not job["future"].done():
+        waited = int(time.monotonic() - job["submitted_at"])
+        st.session_state.pipeline_message = f"Waiting for the processing worker ({waited}s). Another job is active."
     st.progress(st.session_state.get("pipeline_progress", 0.0))
     st.info(st.session_state.get("pipeline_message", "Processing video..."))
     if not job["future"].done():
         if st.button("Cancel processing", key="cancel_pipeline"):
             job["cancel"].set()
-            st.warning("Cancellation requested. The active render will stop safely.")
+            if job["future"].cancel():
+                st.session_state.pipeline_message = "Queued job cancelled."
+            else:
+                st.session_state.pipeline_message = "Cancellation requested. The active stage will stop at its next safe checkpoint."
+            st.warning(st.session_state.pipeline_message)
         return
     try:
         result = job["future"].result()
@@ -491,37 +510,47 @@ with col_start:
     )
 
 if start_button:
-    st.session_state.final_clips = None
-    st.session_state.final_clips = None
-    st.session_state.zip_path = None
-    st.session_state.candidate_clips = None
-    st.session_state.pipeline_timings = {}
-    st.session_state.pipeline_error = None
-    source = {"kind": "upload", "file": uploaded_file} if uploaded_file is not None else {"kind": "youtube", "url": yt_url}
-    settings = {
-        "whisper_model": whisper_model,
-        "performance_mode": performance_mode,
-        "num_clips": num_clips,
-        "gemini_key": gemini_key,
-        "gemini_model": gemini_model_choice,
-        "use_gemini": ai_provider == "Google Gemini API",
-        "layout_mode": layout_mode,
-        "subtitle_style": subtitle_style,
-        "burn_subtitles": burn_subtitles,
-        "caption_font": caption_font,
-        "caption_size": caption_size,
-        "caption_position": caption_position,
-        "caption_background": caption_background,
-        "caption_text_color": caption_text_color,
-        "caption_highlight_color": caption_highlight_color,
-        "caption_animation": caption_animation,
-    }
-    event_queue = queue.Queue()
-    cancel_signal = threading.Event()
-    future = _pipeline_executor().submit(_run_pipeline_job, source, settings, event_queue, cancel_signal)
-    st.session_state.pipeline_job = {"future": future, "queue": event_queue, "cancel": cancel_signal}
-    st.session_state.pipeline_progress = 0.0
-    st.session_state.pipeline_message = "Starting pipeline..."
+    if not _pipeline_slot_lock.acquire(blocking=False):
+        st.session_state.pipeline_error = "Another processing job is already active on this server. Wait for it to finish before starting another."
+    else:
+        st.session_state.final_clips = None
+        st.session_state.zip_path = None
+        st.session_state.candidate_clips = None
+        st.session_state.pipeline_timings = {}
+        st.session_state.pipeline_error = None
+        source = {"kind": "upload", "file": uploaded_file} if uploaded_file is not None else {"kind": "youtube", "url": yt_url.strip()}
+        if source["kind"] == "youtube" and st.session_state.youtube_info_url == source["url"]:
+            source["info"] = st.session_state.youtube_info
+        settings = {
+            "whisper_model": whisper_model,
+            "performance_mode": performance_mode,
+            "num_clips": num_clips,
+            "gemini_key": gemini_key,
+            "gemini_model": gemini_model_choice,
+            "use_gemini": ai_provider == "Google Gemini API",
+            "layout_mode": layout_mode,
+            "subtitle_style": subtitle_style,
+            "burn_subtitles": burn_subtitles,
+            "caption_font": caption_font,
+            "caption_size": caption_size,
+            "caption_position": caption_position,
+            "caption_background": caption_background,
+            "caption_text_color": caption_text_color,
+            "caption_highlight_color": caption_highlight_color,
+            "caption_animation": caption_animation,
+        }
+        event_queue = queue.Queue()
+        cancel_signal = threading.Event()
+        started_event = threading.Event()
+        submitted_at = time.monotonic()
+        future = _pipeline_executor().submit(_run_pipeline_job, source, settings, event_queue, cancel_signal, started_event)
+        future.add_done_callback(lambda _future: _pipeline_slot_lock.release())
+        st.session_state.pipeline_job = {
+            "future": future, "queue": event_queue, "cancel": cancel_signal,
+            "started": started_event, "submitted_at": submitted_at,
+        }
+        st.session_state.pipeline_progress = 0.0
+        st.session_state.pipeline_message = "Queued for the processing worker..."
 
 if st.session_state.pipeline_job is not None:
     _pipeline_progress_fragment()
